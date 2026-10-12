@@ -18,6 +18,8 @@ from PySide6.QtCore import Qt, QRectF, QSize
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core import EditSession
+import theme
+from PySide6.QtWidgets import QToolButton
 
 APP_TITLE = "pdfedit — PDF 文本编辑器"
 
@@ -522,7 +524,16 @@ class MainWindow(QMainWindow):
         self.scroll = QScrollArea()
         self.scroll.setWidget(self.canvas)
         self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setViewportMargins(28, 24, 28, 24)
+        self.scroll.setFrameShape(QScrollArea.NoFrame)
         self.setCentralWidget(self.scroll)
+        # 页面阴影（贴近 WPS 阅读视图的页面浮层效果）
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 4)
+        shadow.setColor(QColor(30, 40, 60, 70))
+        self.canvas.setGraphicsEffect(shadow)
 
         self._build_toolbar()
         self.statusBar().showMessage("就绪 — Ctrl+O 打开 PDF，点击文字开始编辑")
@@ -530,85 +541,136 @@ class MainWindow(QMainWindow):
         if doc_path and os.path.exists(doc_path):
             self.load_doc(doc_path)
 
-    # ---------- 工具栏 ----------
+    # ---------- 工具栏（WPS 风格双行头部） ----------
     def _build_toolbar(self):
-        tb = QToolBar("主工具栏")
-        tb.setMovable(False)
-        self.addToolBar(tb)
+        from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel
+        from PySide6.QtGui import QActionGroup
+        header = QWidget(objectName="header")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(10, 6, 10, 6)
+        h.setSpacing(4)
+        row1 = QHBoxLayout()
+        row1.setSpacing(4)
 
-        def act(text, tip, shortcut, slot, checkable=False):
-            a = QAction(text, self)
-            a.setStatusTip(tip)
-            a.setCheckable(checkable)
-            if shortcut:
-                a.setShortcut(QKeySequence(shortcut))
-            a.triggered.connect(slot)
-            tb.addAction(a)
-            return a
+        self._acts = {}
 
-        act("打开", "打开 PDF 文件 (Ctrl+O)", "Ctrl+O", self.open_doc)
-        self.a_undo = act("↶ 撤销", "撤销 (Ctrl+Z)", "Ctrl+Z", self.do_undo)
-        self.a_redo = act("↷ 重做", "重做 (Ctrl+Y)", "Ctrl+Y", self.do_redo)
-        self.a_save = act("保存（增量）", "单层增量保存 (Ctrl+S)", "Ctrl+S", self.do_save)
-        tb.addSeparator()
-        act("－", "缩小", "-", lambda: self.zoom_by(-0.25))
+        self._mk_row_btn(row1, "open", "打开", "打开 PDF 文件 (Ctrl+O)", self.open_doc, "Ctrl+O", icon="open")
+        self.a_undo = self._mk_row_btn(row1, "undo", "↶ 撤销", "撤销 (Ctrl+Z)", self.do_undo, "Ctrl+Z", icon="undo")
+        self.a_redo = self._mk_row_btn(row1, "redo", "↷ 重做", "重做 (Ctrl+Y)", self.do_redo, "Ctrl+Y", icon="redo")
+        self.a_save = self._mk_row_btn(row1, "save", "保存", "单层增量保存 (Ctrl+S)", self.do_save, "Ctrl+S", accent=True)
+        row1.addSpacing(12)
+        self._mk_row_btn(row1, "zoom_out", "－", "缩小", lambda: self.zoom_by(-0.25), "-", icon="zoom_out")
         self.lbl_zoom = QLabel(" 150% ")
-        tb.addWidget(self.lbl_zoom)
-        act("＋", "放大", "=", lambda: self.zoom_by(+0.25))
-        tb.addSeparator()
-        self.a_prev = act("◀ 上一页", "上一页 (PgUp)", "PgUp", lambda: self.page_by(-1))
+        self.lbl_zoom.setStyleSheet("color:#9AA1AC; font-size:12px;")
+        row1.addWidget(self.lbl_zoom)
+        self._mk_row_btn(row1, "zoom_in", "＋", "放大", lambda: self.zoom_by(+0.25), "=", icon="zoom_in")
+        row1.addSpacing(12)
+        self.a_prev = self._mk_row_btn(row1, "prev", "◀", "上一页 (PgUp)", lambda: self.page_by(-1), "PgUp", icon="prev")
         self.spin_page = QSpinBox()
         self.spin_page.setMinimum(1)
         self.spin_page.valueChanged.connect(self.goto_page)
-        tb.addWidget(self.spin_page)
-        self.a_next = act("下一页 ▶", "下一页 (PgDn)", "PgDn", lambda: self.page_by(+1))
-        tb.addSeparator()
+        row1.addWidget(self.spin_page)
+        self.a_next = self._mk_row_btn(row1, "next", "▶", "下一页 (PgDn)", lambda: self.page_by(+1), "PgDn", icon="next")
+        h.addLayout(row1)
+        h.addStretch(1)
+        lbl_app = QLabel("pdfedit")
+        lbl_app.setStyleSheet(f"color:{theme.BRAND.name()}; font-size:15px; font-weight:700; padding-right:4px;")
+        h.addWidget(lbl_app)
+        v = QVBoxLayout()
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        v.addWidget(header)
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(10, 0, 10, 8)
+        row2.setSpacing(2)
 
-        # ---- 工具组（互斥）：编辑 ----
-        from PySide6.QtGui import QActionGroup
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
         self.tools = {}
 
-        def tool(key, text, tip):
+        def group_label(t):
+            l = QLabel(t, objectName="groupLabel")
+            row2.addWidget(l)
+
+        def tool(key, text, tip, icon):
             a = QAction(text, self)
             a.setStatusTip(tip)
             a.setCheckable(True)
+            a.setIcon(theme.tool_icon(icon))
             a.triggered.connect(lambda: self.set_tool(key))
             self.tool_group.addAction(a)
-            tb.addAction(a)
+            b = QToolButton()
+            b.setDefaultAction(a)
+            b.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            b.setIconSize(QSize(22, 22))
+            row2.addWidget(b)
             self.tools[key] = a
             return a
 
-        tool("select", "➊ 选择/编辑", "点击文字编辑，拖动移动；点击批注选中（Del 删除）")
-        tool("insert_text", "T 插入文字", "点击页面空白处新建文字")
-        tool("insert_image", "🖼 插入图片", "选择图片后点击页面放置")
-        tool("highlight", "🖍 高亮", "点击文字行高亮")
-        tool("area_hl", "▩ 区域高亮", "拖动矩形区域高亮")
-        tool("underline", "U̲ 下划线", "点击文字行加下划线")
-        tool("strikeout", "S̶ 删除线", "点击文字行加删除线")
-        tool("note", "🗒 便签", "点击位置插入文字便签")
-        tool("textbox", "▭ 文本框", "拖动矩形区域插入文本框批注")
-        tool("ink", "✎ 随意画", "按住拖动自由手绘")
-        tool("rect", "□ 矩形", "拖动绘制矩形批注")
-        tool("oval", "◯ 椭圆", "拖动绘制椭圆批注")
-        tool("line", "／ 直线", "拖动绘制直线")
-        tool("arrow", "→ 箭头", "拖动绘制箭头")
-        tool("stamp", "🏷 图章", "点击位置加盖图章")
+        group_label("编辑")
+        tool("select", "选择/编辑", "点击文字编辑，拖动移动；点击批注选中（Del 删除）", "select")
+        tool("insert_text", "插入文字", "点击页面空白处新建文字", "insert_text")
+        tool("insert_image", "插入图片", "选择图片后点击页面放置", "insert_image")
+        group_label("批注")
+        tool("highlight", "高亮", "点击文字行高亮", "highlight")
+        tool("area_hl", "区域高亮", "拖动矩形区域高亮", "area_hl")
+        tool("underline", "下划线", "点击文字行加下划线", "underline")
+        tool("strikeout", "删除线", "点击文字行加删除线", "strikeout")
+        tool("note", "便签", "点击位置插入文字便签", "note")
+        tool("textbox", "文本框", "拖动矩形区域插入文本框批注", "textbox")
+        tool("ink", "随意画", "按住拖动自由手绘", "ink")
+        tool("rect", "矩形", "拖动绘制矩形批注", "rect")
+        tool("oval", "椭圆", "拖动绘制椭圆批注", "oval")
+        tool("line", "直线", "拖动绘制直线", "line")
+        tool("arrow", "箭头", "拖动绘制箭头", "arrow")
+        tool("stamp", "图章", "点击位置加盖图章", "stamp")
+        group_label("文档")
+        self._mk_row_btn(row2, "watermark", "水印", "全文档文字水印", self.act_watermark, None, text_mode=True)
+        self._mk_row_btn(row2, "rotate", "⟳ 旋转页", "当前页旋转90°", self.act_rotate, None, text_mode=True)
+        self.a_hide = self._mk_row_btn(row2, "hide", "隐藏批注", "切换批注显示/隐藏 (F9)", self.act_toggle_annots, "F9", checkable=True, text_mode=True)
+        self._mk_row_btn(row2, "export_annots", "导出批注", "批注导出为 JSON", self.act_export_annots, None, text_mode=True)
+        self._mk_row_btn(row2, "import_annots", "导入批注", "从 JSON 导入批注", self.act_import_annots, None, text_mode=True)
+        self._mk_row_btn(row2, "list_annots", "批注列表", "查看全部批注", self.act_list_annots, None, text_mode=True)
         self.tools["select"].setChecked(True)
-        tb.addSeparator()
-
-        act("水印…", "全文档文字水印", "", self.act_watermark)
-        act("⟳ 旋转页", "当前页旋转90°", "", self.act_rotate)
-        self.a_hide = act("隐藏批注", "切换批注显示/隐藏", "F9", self.act_toggle_annots)
-        self.a_hide.setCheckable(True)
-        act("导出批注", "批注导出为 JSON", "", self.act_export_annots)
-        act("导入批注", "从 JSON 导入批注", "", self.act_import_annots)
-        act("批注列表", "查看全部批注", "", self.act_list_annots)
+        row2.addStretch(1)
+        row2w = QWidget()
+        row2w.setLayout(row2)
+        v.addWidget(row2w)
+        wrap = QWidget()
+        wrap.setLayout(v)
+        self.menuBar().hide()
+        self.setMenuWidget(wrap)      # 头部占据菜单栏位置，始终置顶
 
         for a in (self.a_undo, self.a_redo, self.a_save, self.a_prev, self.a_next):
             a.setEnabled(False)
         self.spin_page.setEnabled(False)
+
+    def _mk_row_btn(self, row, key, text, tip, slot, shortcut=None,
+                    checkable=False, accent=False, icon=None, text_mode=False):
+        a = QAction(text, self)
+        a.setStatusTip(tip)
+        a.setCheckable(checkable)
+        if shortcut:
+            a.setShortcut(QKeySequence(shortcut))
+        if slot is not None:
+            a.triggered.connect(slot)
+        b = QToolButton()
+        b.setDefaultAction(a)
+        b.setIconSize(QSize(18, 18))
+        if icon is not None:
+            a.setIcon(theme.tool_icon(icon))
+        if accent:
+            b.setObjectName("accent")
+            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        elif text_mode:
+            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        elif a.icon().isNull():
+            b.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        else:
+            b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        row.addWidget(b)
+        self._acts[key] = a
+        return a
 
     # ---------- 工具状态 ----------
     def set_tool(self, key):
@@ -836,8 +898,12 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("pdfedit")
+    app.setStyle("Fusion")
+    app.setStyleSheet(theme.QSS)
+    app.setWindowIcon(theme.app_icon())
     path = sys.argv[1] if len(sys.argv) > 1 else None
     win = MainWindow(path)
+    win.setWindowIcon(theme.app_icon())
     win.show()
     sys.exit(app.exec())
 
