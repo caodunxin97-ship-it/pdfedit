@@ -1,0 +1,16 @@
+# 构建产物
+dist/
+build/
+*.spec
+*.zip
+
+# 测试产物
+*.pdf
+edit_journal.json
+__pycache__/
+*.pyc
+
+# 会话/杂项
+.venv/
+/desk_shot_*.png
+/mvp_*.png
