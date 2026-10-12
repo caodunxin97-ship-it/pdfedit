@@ -64,24 +64,22 @@ def _norm_font(name: str) -> str:
 
 
 class Op:
-    """一次编辑操作：replace（改文字）或 move（移位置）。
-    定位规则：在 page 上找当前文本 == old_text 的第 occurrence 个 span，
-    并用编辑时记录的 bbox 做距离校验（容差 2pt），匹配失败抛异常。
+    """编辑操作。kind ∈ replace | move | annot_add | annot_del |
+    insert_text | insert_image | watermark | page_rotate
+    文字类（replace/move）定位规则：在 page 上找当前文本 == old_text 的
+    第 occurrence 个 span，bbox 距离校验（容差 2pt）。其余见 data。
     """
-    __slots__ = ("page", "old_text", "occurrence", "new_text", "anchor_bbox",
-                 "kind", "dx", "dy")
+    __slots__ = ("kind", "page", "data")
 
-    def __init__(self, page, old_text, occurrence, new_text, anchor_bbox,
-                 kind="replace", dx=0.0, dy=0.0):
-        self.page, self.old_text, self.occurrence = page, old_text, occurrence
-        self.new_text, self.anchor_bbox = new_text, anchor_bbox
-        self.kind, self.dx, self.dy = kind, dx, dy
+    def __init__(self, kind, page, data):
+        self.kind, self.page, self.data = kind, page, data
+
+    @property
+    def old_text(self):     # replace/move 兼容属性
+        return self.data["old_text"]
 
     def to_json(self):
-        return dict(page=self.page, old_text=self.old_text,
-                    occurrence=self.occurrence, new_text=self.new_text,
-                    anchor_bbox=self.anchor_bbox, kind=self.kind,
-                    dx=self.dx, dy=self.dy)
+        return dict(kind=self.kind, page=self.page, data=self.data)
 
 
 class EditSession:
@@ -145,12 +143,10 @@ class EditSession:
         target = spans[span_id]
         same = [s for s in spans if s["text"] == target["text"]]
         occ = same.index(target)
-        op = Op(page_idx, target["text"], occ, new_text, target["bbox"])
-        self._apply(self.view(), op)         # 立即作用于当前视图
-        self.ops = self.ops[:self.ptr]       # 丢弃被撤销的尾部分支
-        self.ops.append(op)
-        self.ptr += 1
-        return op
+        op = Op("replace", page_idx, dict(
+            old_text=target["text"], occurrence=occ, new_text=new_text,
+            anchor=list(target["bbox"])))
+        return self._exec(op)
 
     def move_span(self, page_idx: int, span_id: int, dx: float, dy: float) -> Op:
         """移动文字位置（页面坐标增量，y 向下为正）"""
@@ -160,8 +156,43 @@ class EditSession:
         target = spans[span_id]
         same = [s for s in spans if s["text"] == target["text"]]
         occ = same.index(target)
-        op = Op(page_idx, target["text"], occ, target["text"], target["bbox"],
-                kind="move", dx=dx, dy=dy)
+        op = Op("move", page_idx, dict(
+            old_text=target["text"], occurrence=occ,
+            anchor=list(target["bbox"]), dx=dx, dy=dy))
+        return self._exec(op)
+
+    # ---------- 新增操作入口（v1.1） ----------
+    def annot_add(self, page_idx: int, subtype: str, **params) -> Op:
+        """添加批注。subtype: highlight/underline/strikeout/note/freetext/
+        ink/rect/oval/line/arrow/stamp。params 与 subtype 对应（见 _apply_annot_add）"""
+        op = Op("annot_add", page_idx, dict(subtype=subtype, **params))
+        return self._exec(op)
+
+    def annot_delete(self, page_idx: int, subtype: str, rect, content: str = "") -> Op:
+        op = Op("annot_del", page_idx, dict(subtype=subtype, rect=list(rect), content=content))
+        return self._exec(op)
+
+    def insert_text(self, page_idx: int, point, text: str, size: float = 12.0,
+                    color: int = 0, font: str = "SimSun") -> Op:
+        op = Op("insert_text", page_idx, dict(
+            point=[point[0], point[1]], text=text, size=size, color=color, font=font))
+        return self._exec(op)
+
+    def insert_image(self, page_idx: int, rect, img_bytes: bytes) -> Op:
+        import base64
+        op = Op("insert_image", page_idx, dict(
+            rect=list(rect), img_b64=base64.b64encode(img_bytes).decode()))
+        return self._exec(op)
+
+    def add_watermark(self, text: str, color=(0.82, 0.82, 0.82), size: float = 42) -> Op:
+        op = Op("watermark", 0, dict(text=text, color=list(color), size=size))
+        return self._exec(op)
+
+    def rotate_page(self, page_idx: int, delta: int = 90) -> Op:
+        op = Op("page_rotate", page_idx, dict(delta=delta))
+        return self._exec(op)
+
+    def _exec(self, op: Op) -> Op:
         self._apply(self.view(), op)
         self.ops = self.ops[:self.ptr]
         self.ops.append(op)
@@ -189,19 +220,136 @@ class EditSession:
 
     # ---------- 底层应用（重放与即时共用） ----------
     def _apply(self, doc: fitz.Document, op: Op):
+        if op.kind in ("replace", "move"):
+            self._apply_text(doc, op)
+        elif op.kind == "annot_add":
+            self._apply_annot_add(doc[op.page], op.data)
+        elif op.kind == "annot_del":
+            self._apply_annot_del(doc[op.page], op.data)
+        elif op.kind == "insert_text":
+            page = doc[op.page]
+            p = op.data["point"]
+            self._write_text(page, {"font": op.data["font"], "color": op.data["color"],
+                                    "size": op.data["size"], "origin": tuple(p)},
+                             op.data["text"], fitz.Point(*p))
+        elif op.kind == "insert_image":
+            import base64
+            doc[op.page].insert_image(fitz.Rect(op.data["rect"]),
+                                      stream=base64.b64decode(op.data["img_b64"]))
+        elif op.kind == "watermark":
+            d = op.data
+            for i in range(doc.page_count):
+                page = doc[i]
+                w, h = page.rect.width, page.rect.height
+                pivot = fitz.Point(w / 2, h / 2)
+                m = fitz.Matrix(1, 1).prerotate(32)
+                page.insert_text(fitz.Point(w * 0.12, h * 0.62), d["text"],
+                                 fontsize=d["size"], color=tuple(d["color"]),
+                                 morph=(pivot, m), overlay=True)
+        elif op.kind == "page_rotate":
+            page = doc[op.page]
+            page.set_rotation((page.rotation + op.data["delta"]) % 360)
+
+    def _apply_annot_add(self, page, d: dict):
+        sub = d["subtype"]
+        R = fitz.Rect
+        P = fitz.Point
+        if sub in ("highlight", "underline", "strikeout"):
+            quads = [fitz.Quad(fitz.Point(q[0], q[1]), fitz.Point(q[2], q[3]),
+                               fitz.Point(q[6], q[7]), fitz.Point(q[4], q[5]))
+                     for q in d["quads"]]   # 存储序: ul,ur,lr,ll → Quad(ul,ur,ll,lr)
+            if sub == "highlight":
+                a = page.add_highlight_annot(quads)
+            elif sub == "underline":
+                a = page.add_underline_annot(quads)
+            else:
+                a = page.add_strikeout_annot(quads)
+            a.set_colors(stroke=tuple(d.get("color", (1, 1, 0))))
+            a.update()
+        elif sub == "note":
+            a = page.add_text_annot(P(d["point"]), d.get("content", ""),
+                                    icon=d.get("icon", "Comment"))
+            a.set_colors(stroke=tuple(d.get("color", (0.95, 0.75, 0.05))))
+            a.update()
+        elif sub == "freetext":
+            a = page.add_freetext_annot(R(d["rect"]), d.get("content", ""),
+                                        fontsize=d.get("size", 12),
+                                        fontname="china-s",
+                                        text_color=tuple(d.get("color", (0, 0, 0.8))))
+            a.update()
+        elif sub == "ink":
+            strokes = [[(p[0], p[1]) for p in s] for s in d["strokes"]]
+            a = page.add_ink_annot(strokes)
+            a.set_colors(stroke=tuple(d.get("color", (0.8, 0, 0))))
+            a.update()
+        elif sub == "rect":
+            a = page.add_rect_annot(R(d["rect"]))
+            a.set_colors(stroke=tuple(d.get("color", (0.8, 0, 0))))
+            a.update()
+        elif sub == "oval":
+            a = page.add_circle_annot(R(d["rect"]))
+            a.set_colors(stroke=tuple(d.get("color", (0.8, 0, 0))))
+            a.update()
+        elif sub in ("line", "arrow"):
+            p1, p2 = P(d["p1"]), P(d["p2"])
+            if sub == "line":
+                a = page.add_line_annot(p1, p2)
+            else:   # 箭头：主线 + 两笔箭头（ink 组合）
+                import math
+                x1, y1, x2, y2 = d["p1"][0], d["p1"][1], d["p2"][0], d["p2"][1]
+                ang = math.atan2(y2 - y1, x2 - x1)
+                L = min(14.0, math.hypot(x2 - x1, y2 - y1) * 0.2)
+                s1 = [(x2, y2), (x2 - L * math.cos(ang - 0.5), y2 - L * math.sin(ang - 0.5))]
+                s2 = [(x2, y2), (x2 - L * math.cos(ang + 0.5), y2 - L * math.sin(ang + 0.5))]
+                a = page.add_ink_annot([[(x1, y1), (x2, y2)], s1, s2])
+            a.set_colors(stroke=tuple(d.get("color", (0.8, 0, 0))))
+            a.update()
+        elif sub == "stamp":
+            name = d.get("stamp", "Approved")
+            stamp_id = getattr(fitz, f"STAMP_{name}", fitz.STAMP_Approved)
+            a = page.add_stamp_annot(R(d["rect"]), stamp=stamp_id)
+            a.update()
+
+    @staticmethod
+    def _apply_annot_del(page, d: dict):
+        sub = d["subtype"]
+        want = {"highlight": 8, "underline": 9, "strikeout": 10, "note": 0,
+                "freetext": 2, "ink": 15, "rect": 4, "oval": 5,
+                "line": 3, "arrow": 15, "stamp": 13}.get(sub)
+        target = fitz.Rect(d["rect"])
+        best, best_d = None, -1.0
+        for a in page.annots():
+            if want is not None and a.type[0] != want:
+                continue
+            r = a.rect & target
+            inter = r.get_area() if not r.is_empty else 0
+            if inter == 0:
+                continue
+            if d.get("content") and (a.info.get("content", "") != d["content"]):
+                continue
+            area = min(a.rect.get_area(), target.get_area()) or 1
+            score = inter / area
+            if score > best_d:
+                best, best_d = a, score
+        if best is None:
+            raise RuntimeError(f"annot_del: 未找到匹配批注 {sub}")
+        page.delete_annot(best)
+
+    def _apply_text(self, doc: fitz.Document, op: Op):
         page = doc[op.page]
+        d = op.data
         # 在当前文档状态里找目标 span
         cands = []
         for block in page.get_text("dict")["blocks"]:
             for line in block.get("lines", []):
                 for span in line["spans"]:
-                    if span["text"] == op.old_text:
+                    if span["text"] == d["old_text"]:
                         cands.append(span)
-        if op.occurrence >= len(cands):
-            raise RuntimeError(f"重放失败: 找不到 '{op.old_text[:20]}…' #{op.occurrence}")
+        if d["occurrence"] >= len(cands):
+            raise RuntimeError(f"重放失败: 找不到 '{d['old_text'][:20]}…' #{d['occurrence']}")
         # anchor 距离校验（容差 2pt），同文本多 span 时选最近的
-        ax = (op.anchor_bbox[0] + op.anchor_bbox[2]) / 2
-        ay = (op.anchor_bbox[1] + op.anchor_bbox[3]) / 2
+        ax = (d["anchor"][0] + d["anchor"][2]) / 2
+        ay = (d["anchor"][1] + d["anchor"][3]) / 2
         def dist(s):
             bx = (s["bbox"][0] + s["bbox"][2]) / 2
             by = (s["bbox"][1] + s["bbox"][3]) / 2
@@ -220,9 +368,9 @@ class EditSession:
                               graphics=fitz.PDF_REDACT_LINE_ART_NONE)
         # move 操作：同样文字，写入平移后的基线原点
         origin = fitz.Point(*span["origin"])
-        text = op.new_text if op.kind == "replace" else op.old_text
+        text = d["new_text"] if op.kind == "replace" else d["old_text"]
         if op.kind == "move":
-            origin = fitz.Point(origin.x + op.dx, origin.y + op.dy)
+            origin = fitz.Point(origin.x + d["dx"], origin.y + d["dy"])
         self._write_text(page, span, text, origin)
 
     def _sample_bg(self, page, bbox):
@@ -362,9 +510,21 @@ class EditSession:
         return all(f.has_glyph(ord(c)) for c in text)
 
     # ---------- 渲染 ----------
-    def render_png(self, page_idx: int, zoom: float = 1.5) -> bytes:
-        pix = self.view()[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+    def render_png(self, page_idx: int, zoom: float = 1.5, annots: bool = True) -> bytes:
+        pix = self.view()[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                               annots=annots)
         return pix.tobytes("png")
+
+    def list_annots(self):
+        """全部批注清单（管理/导出用）"""
+        out = []
+        for pno in range(self.view().page_count):
+            for a in self.view()[pno].annots() or []:
+                out.append({
+                    "page": pno, "xref": a.xref, "type": a.type[1],
+                    "rect": list(a.rect), "content": a.info.get("content", ""),
+                })
+        return out
 
     # ---------- 保存：WPS 式单层增量 ----------
     def save_incremental(self) -> dict:

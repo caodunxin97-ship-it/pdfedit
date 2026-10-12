@@ -22,6 +22,13 @@ from core import EditSession
 APP_TITLE = "pdfedit — PDF 文本编辑器"
 
 
+def _rect_of(p1, p2):
+    """两点（页面坐标）→ QRectF（页面坐标，允许任意方向拖动）"""
+    from PySide6.QtCore import QRectF as _RF
+    return _RF(min(p1[0], p2[0]), min(p1[1], p2[1]),
+               abs(p2[0] - p1[0]), abs(p2[1] - p1[1]))
+
+
 class PageCanvas(QWidget):
     """当前页渲染 + 文字 span 命中/高亮 + 原位编辑框"""
 
@@ -46,20 +53,36 @@ class PageCanvas(QWidget):
         self._guide_v = None        # (x, y0, y1) 竖直参考线
         self._guide_h = None        # (y, x0, x1) 水平参考线
         self.SNAP_PX = 8            # 吸附阈值（像素）
+        # v1.1 工具交互状态
+        self.pending_image = None   # insert_image 待放置图片路径
+        self._rubber = None         # QRectF 橡皮筋（页面坐标）
+        self._ink_pts = None        # 墨迹点列表（页面坐标）
+        self._sel_annot = None      # 选中的批注 (page, type, rect, content)
+        self._annots = []           # 当前页批注缓存
+        self.setFocusPolicy(Qt.ClickFocus)
 
     # ---------- 渲染 ----------
     def refresh(self):
         s = self.main.session
         if s is None:
             return
-        png = s.render_png(self.main.page_num, self.main.zoom)
+        png = s.render_png(self.main.page_num, self.main.zoom,
+                           annots=self.main.show_annots)
         pm = QPixmap()
         pm.loadFromData(png)
         self.pixmap = pm
         self.spans = s.spans(self.main.page_num)
+        try:
+            self._annots = [a for a in s.list_annots()
+                            if a["page"] == self.main.page_num]
+        except Exception:
+            self._annots = []
         self._hover = -1
         self.editor.hide()
         self.editing_span = None
+        self._sel_annot = None
+        self._rubber = None
+        self._ink_pts = None
         self.resize(pm.size())
         self.setMinimumSize(pm.size())
         self.update()
@@ -99,6 +122,26 @@ class PageCanvas(QWidget):
             p.fillRect(self.span_rect(self._hover), QColor(30, 144, 255, 60))
             p.setPen(QPen(QColor(30, 144, 255, 200), 1))
             p.drawRect(self.span_rect(self._hover))
+        z = self.main.zoom
+        # 选中批注高亮框
+        if self._sel_annot:
+            r = self._sel_annot["rect"]
+            p.setPen(QPen(QColor(0, 122, 255), 2))
+            p.drawRect(QRectF(r[0] * z, r[1] * z, (r[2] - r[0]) * z, (r[3] - r[1]) * z))
+        # 橡皮筋预览（区域高亮/文本框/矩形/椭圆/直线/箭头）
+        if self._rubber is not None:
+            r = self._rubber
+            p.setPen(QPen(QColor(255, 140, 0, 220), 1, Qt.DashLine))
+            p.drawRect(QRectF(r.x() * z, r.y() * z, r.width() * z, r.height() * z))
+            if self.main.tool in ("line", "arrow"):
+                p.drawLine(QPointF(r.left() * z, r.bottom() * z),
+                           QPointF(r.right() * z, r.top() * z))
+        # 墨迹预览
+        if self._ink_pts and len(self._ink_pts) > 1:
+            p.setPen(QPen(QColor(200, 0, 0), 2))
+            path_pts = [QPointF(x * z, y * z) for x, y in self._ink_pts]
+            for i in range(len(path_pts) - 1):
+                p.drawLine(path_pts[i], path_pts[i + 1])
         p.end()
 
     # ---------- span ----------
@@ -119,6 +162,23 @@ class PageCanvas(QWidget):
             if d < best_d:
                 best, best_d = i, d
         return best
+
+    def keyPressEvent(self, ev):
+        # Del/Backspace 删除选中的批注
+        if ev.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self._sel_annot:
+            a = self._sel_annot
+            sub = {"Text": "note", "FreeText": "freetext", "Ink": "ink",
+                   "Square": "rect", "Circle": "oval", "Line": "line",
+                   "Stamp": "stamp", "Highlight": "highlight",
+                   "Underline": "underline", "StrikeOut": "strikeout"}.get(a["type"], a["type"])
+            try:
+                self.main.session.annot_delete(a["page"], sub, a["rect"], a["content"])
+                self._sel_annot = None
+                self.main.after_document_change()
+            except Exception as e:
+                QMessageBox.warning(self, "删除批注失败", str(e))
+            return
+        super().keyPressEvent(ev)
 
     def _effective_delta(self):
         """拖拽位移 + 吸附修正（未吸附时修正为零向量）"""
@@ -181,6 +241,17 @@ class PageCanvas(QWidget):
             self._snap_adj = QPointF(adj_x, adj_y)
 
     def mouseMoveEvent(self, ev):
+        z = self.main.zoom
+        pos_pg = (ev.position().x() / z, ev.position().y() / z)
+        # 拖拽类工具的橡皮筋/墨迹更新
+        if self._rubber is not None and (ev.buttons() & Qt.LeftButton):
+            self._rubber = _rect_of(self._rubber_start, pos_pg)
+            self.update()
+            return
+        if self._ink_pts is not None and (ev.buttons() & Qt.LeftButton):
+            self._ink_pts.append(pos_pg)
+            self.update()
+            return
         # 按住左键且命中了 span：超过阈值进入拖拽模式
         if (ev.buttons() & Qt.LeftButton) and self._press_span >= 0 and self._press_pos is not None:
             delta = ev.position() - self._press_pos
@@ -204,15 +275,149 @@ class PageCanvas(QWidget):
     def mousePressEvent(self, ev):
         if ev.button() != Qt.LeftButton:
             return
+        z = self.main.zoom
+        pos_pg = (ev.position().x() / z, ev.position().y() / z)
+        tool = self.main.tool
+
+        # ---- 点击类工具 ----
+        if tool in ("highlight", "underline", "strikeout"):
+            i = self.hit_test(ev.position())
+            if i >= 0:
+                b = self.spans[i]["bbox"]
+                quad = [b[0], b[1], b[2], b[1], b[2], b[3], b[0], b[3]]
+                try:
+                    self.main.session.annot_add(self.main.page_num, tool, quads=[quad])
+                    self.main.after_document_change()
+                except Exception as e:
+                    QMessageBox.warning(self, "批注失败", str(e))
+            return
+        if tool == "note":
+            from PySide6.QtWidgets import QInputDialog
+            text, ok = QInputDialog.getMultiLineText(self, "便签批注", "批注内容：")
+            if ok and text:
+                self.main.session.annot_add(self.main.page_num, "note",
+                                            point=pos_pg, content=text)
+                self.main.after_document_change()
+            return
+        if tool == "stamp":
+            from PySide6.QtWidgets import QInputDialog
+            names = ["Approved", "NotApproved", "Draft", "Final", "Confidential",
+                     "Experimental", "Expired", "Sold", "TopSecret"]
+            name, ok = QInputDialog.getItem(self, "图章", "选择图章：", names, 0, False)
+            if ok:
+                w = h = 80
+                rect = [pos_pg[0], pos_pg[1], pos_pg[0] + w, pos_pg[1] + h]
+                self.main.session.annot_add(self.main.page_num, "stamp",
+                                            rect=rect, stamp=name)
+                self.main.after_document_change()
+            return
+        if tool == "insert_text":
+            self._insert_point = pos_pg
+            ed = self.editor
+            ed.setGeometry(int(ev.position().x()) - 4, int(ev.position().y()) - 16, 220, 24)
+            ed.setText("")
+            self.editing_span = None        # None = 新插入模式
+            ed.show()
+            ed.setFocus()
+            return
+        if tool == "insert_image" and self.pending_image:
+            try:
+                with open(self.pending_image, "rb") as f:
+                    img_bytes = f.read()
+                w_pt = 180
+                h_pt = 135
+                try:
+                    import fitz as _fz
+                    pm = _fz.Pixmap(img_bytes)
+                    h_pt = w_pt * pm.height / pm.width
+                except Exception:
+                    pass
+                rect = [pos_pg[0], pos_pg[1], pos_pg[0] + w_pt, pos_pg[1] + h_pt]
+                self.main.session.insert_image(self.main.page_num, rect, img_bytes)
+                self.main.after_document_change()
+            except Exception as e:
+                QMessageBox.warning(self, "插入图片失败", str(e))
+            return
+
+        # ---- 拖拽类工具：按下即开始橡皮筋/墨迹 ----
+        if tool in ("area_hl", "textbox", "rect", "oval", "line", "arrow"):
+            self._rubber = _rect_of(pos_pg, pos_pg)
+            self._rubber_start = pos_pg
+            return
+        if tool == "ink":
+            self._ink_pts = [pos_pg]
+            return
+
+        # ---- select 工具：原有行为 + 批注命中 ----
         i = self.hit_test(ev.position())
+        if i < 0:
+            hit = self._annot_at(pos_pg)
+            self._sel_annot = hit
+            self.update()
         self._press_pos = ev.position()
         self._press_span = i
         self._dragging = False
         self._drag_delta = None
 
+    def _annot_at(self, pos_pg):
+        x, y = pos_pg
+        for a in self._annots:
+            r = a["rect"]
+            if r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                return a
+        return None
+
     def mouseReleaseEvent(self, ev):
         if ev.button() != Qt.LeftButton:
             return
+        z = self.main.zoom
+        pos_pg = (ev.position().x() / z, ev.position().y() / z)
+        tool = self.main.tool
+        # ---- 拖拽类工具提交 ----
+        if self._rubber is not None:
+            r = self._rubber
+            rect = [r.x(), r.y(), r.x() + r.width(), r.y() + r.height()]
+            self._rubber = None
+            self.update()
+            if r.width() < 3 or r.height() < 3:
+                return    # 过小视为误触
+            try:
+                if tool == "area_hl":
+                    quad = [rect[0], rect[1], rect[2], rect[1],
+                            rect[2], rect[3], rect[0], rect[3]]
+                    self.main.session.annot_add(self.main.page_num, "highlight", quads=[quad])
+                elif tool == "textbox":
+                    from PySide6.QtWidgets import QInputDialog
+                    text, ok = QInputDialog.getMultiLineText(self, "文本框批注", "内容：")
+                    if ok and text:
+                        self.main.session.annot_add(self.main.page_num, "freetext",
+                                                    rect=rect, content=text, size=12)
+                    else:
+                        return
+                elif tool == "rect":
+                    self.main.session.annot_add(self.main.page_num, "rect", rect=rect)
+                elif tool == "oval":
+                    self.main.session.annot_add(self.main.page_num, "oval", rect=rect)
+                elif tool in ("line", "arrow"):
+                    self.main.session.annot_add(self.main.page_num, tool,
+                                                p1=[self._rubber_start[0], self._rubber_start[1]],
+                                                p2=[pos_pg[0], pos_pg[1]])
+                self.main.after_document_change()
+            except Exception as e:
+                QMessageBox.warning(self, "批注失败", str(e))
+            return
+        if self._ink_pts is not None:
+            pts, self._ink_pts = self._ink_pts, None
+            self.update()
+            if len(pts) >= 2:
+                try:
+                    self.main.session.annot_add(self.main.page_num, "ink", strokes=[pts])
+                    self.main.after_document_change()
+                except Exception as e:
+                    QMessageBox.warning(self, "批注失败", str(e))
+            return
+
+        # ---- select 工具：拖拽移动 / 点击编辑 / 批注已选中 ----
         i, dragged = self._press_span, self._dragging
         self._press_span, self._press_pos = -1, None
         self._dragging = False
@@ -273,6 +478,19 @@ class PageCanvas(QWidget):
         return super().eventFilter(obj, ev)
 
     def commit_edit(self):
+        # 插入文字模式（insert_text 工具）
+        if self.editing_span is None and getattr(self, "_insert_point", None):
+            text = self.editor.text()
+            pt = self._insert_point
+            self._insert_point = None
+            self.editor.hide()
+            if text:
+                try:
+                    self.main.session.insert_text(self.main.page_num, pt, text, size=12)
+                except Exception as e:
+                    QMessageBox.warning(self, "插入失败", str(e))
+                self.main.after_document_change()
+            return
         if self.editing_span is None:
             return
         idx = self.editing_span
@@ -297,6 +515,8 @@ class MainWindow(QMainWindow):
         self.session: EditSession | None = None
         self.zoom = 1.5
         self.page_num = 0
+        self.tool = "select"
+        self.show_annots = True
 
         self.canvas = PageCanvas(self)
         self.scroll = QScrollArea()
@@ -319,6 +539,7 @@ class MainWindow(QMainWindow):
         def act(text, tip, shortcut, slot, checkable=False):
             a = QAction(text, self)
             a.setStatusTip(tip)
+            a.setCheckable(checkable)
             if shortcut:
                 a.setShortcut(QKeySequence(shortcut))
             a.triggered.connect(slot)
@@ -341,9 +562,166 @@ class MainWindow(QMainWindow):
         self.spin_page.valueChanged.connect(self.goto_page)
         tb.addWidget(self.spin_page)
         self.a_next = act("下一页 ▶", "下一页 (PgDn)", "PgDn", lambda: self.page_by(+1))
+        tb.addSeparator()
+
+        # ---- 工具组（互斥）：编辑 ----
+        from PySide6.QtGui import QActionGroup
+        self.tool_group = QActionGroup(self)
+        self.tool_group.setExclusive(True)
+        self.tools = {}
+
+        def tool(key, text, tip):
+            a = QAction(text, self)
+            a.setStatusTip(tip)
+            a.setCheckable(True)
+            a.triggered.connect(lambda: self.set_tool(key))
+            self.tool_group.addAction(a)
+            tb.addAction(a)
+            self.tools[key] = a
+            return a
+
+        tool("select", "➊ 选择/编辑", "点击文字编辑，拖动移动；点击批注选中（Del 删除）")
+        tool("insert_text", "T 插入文字", "点击页面空白处新建文字")
+        tool("insert_image", "🖼 插入图片", "选择图片后点击页面放置")
+        tool("highlight", "🖍 高亮", "点击文字行高亮")
+        tool("area_hl", "▩ 区域高亮", "拖动矩形区域高亮")
+        tool("underline", "U̲ 下划线", "点击文字行加下划线")
+        tool("strikeout", "S̶ 删除线", "点击文字行加删除线")
+        tool("note", "🗒 便签", "点击位置插入文字便签")
+        tool("textbox", "▭ 文本框", "拖动矩形区域插入文本框批注")
+        tool("ink", "✎ 随意画", "按住拖动自由手绘")
+        tool("rect", "□ 矩形", "拖动绘制矩形批注")
+        tool("oval", "◯ 椭圆", "拖动绘制椭圆批注")
+        tool("line", "／ 直线", "拖动绘制直线")
+        tool("arrow", "→ 箭头", "拖动绘制箭头")
+        tool("stamp", "🏷 图章", "点击位置加盖图章")
+        self.tools["select"].setChecked(True)
+        tb.addSeparator()
+
+        act("水印…", "全文档文字水印", "", self.act_watermark)
+        act("⟳ 旋转页", "当前页旋转90°", "", self.act_rotate)
+        self.a_hide = act("隐藏批注", "切换批注显示/隐藏", "F9", self.act_toggle_annots)
+        self.a_hide.setCheckable(True)
+        act("导出批注", "批注导出为 JSON", "", self.act_export_annots)
+        act("导入批注", "从 JSON 导入批注", "", self.act_import_annots)
+        act("批注列表", "查看全部批注", "", self.act_list_annots)
+
         for a in (self.a_undo, self.a_redo, self.a_save, self.a_prev, self.a_next):
             a.setEnabled(False)
         self.spin_page.setEnabled(False)
+
+    # ---------- 工具状态 ----------
+    def set_tool(self, key):
+        self.canvas.pending_image = self.canvas.pending_image if key != "insert_image" else self.canvas.pending_image
+        if key == "insert_image" and not self.canvas.pending_image:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.bmp)")
+            if not path:
+                self.tools["select"].setChecked(True)
+                return
+            self.canvas.pending_image = path
+        if key != "insert_image":
+            self.canvas.pending_image = None
+        self.tool = key
+        cur = {"select": Qt.ArrowCursor, "ink": Qt.CrossCursor,
+               "textbox": Qt.IBeamCursor}.get(key, Qt.CrossCursor)
+        self.canvas.setCursor(cur)
+        self.statusBar().showMessage(f"当前工具: {key} — {self.tools[key].statusTip()}", 4000)
+
+    # ---------- 工具动作 ----------
+    def act_watermark(self):
+        if not self.session:
+            return
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, "水印", "水印文字：", text="DRAFT")
+        if ok and text:
+            self.session.add_watermark(text)
+            self.after_document_change()
+
+    def act_rotate(self):
+        if self.session:
+            self.session.rotate_page(self.page_num, 90)
+            self.after_document_change()
+
+    def act_toggle_annots(self, checked):
+        self.show_annots = not checked
+        self.canvas.refresh()
+
+    def act_export_annots(self):
+        if not self.session:
+            return
+        import json
+        path, _ = QFileDialog.getSaveFileName(self, "导出批注", "annotations.json", "JSON (*.json)")
+        if not path:
+            return
+        data = self.session.list_annots()
+        json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        self.statusBar().showMessage(f"已导出 {len(data)} 条批注 -> {path}", 8000)
+
+    def act_import_annots(self):
+        if not self.session:
+            return
+        import json
+        path, _ = QFileDialog.getOpenFileName(self, "导入批注", "", "JSON (*.json)")
+        if not path:
+            return
+        data = json.load(open(path, encoding="utf-8"))
+        n = 0
+        for a in data:
+            sub = {"Text": "note", "FreeText": "freetext", "Ink": "ink",
+                   "Square": "rect", "Circle": "oval", "Line": "line",
+                   "Stamp": "stamp", "Highlight": "highlight",
+                   "Underline": "underline", "StrikeOut": "strikeout"}.get(a["type"])
+            if not sub:
+                continue
+            params = {k: v for k, v in a.items() if k not in ("type",)}
+            if sub in ("highlight", "underline", "strikeout"):
+                r = a["rect"]
+                params["quads"] = [[r[0], r[1], r[2], r[1], r[2], r[3], r[0], r[3]]]
+            try:
+                self.session.annot_add(a["page"], sub, **params)
+                n += 1
+            except Exception:
+                pass
+        self.statusBar().showMessage(f"已导入 {n} 条批注", 8000)
+        self.after_document_change()
+
+    def act_list_annots(self):
+        if not self.session:
+            return
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton, QHBoxLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("批注列表")
+        dlg.resize(500, 400)
+        lst = QListWidget()
+        annots = self.session.list_annots()
+        for a in annots:
+            label = f"第{a['page']+1}页 [{a['type']}] {a['content'][:40] or '(无文字)'}"
+            lst.addItem(label)
+        btn_del = QPushButton("删除选中")
+        btn_close = QPushButton("关闭")
+
+        def del_selected():
+            row = lst.currentRow()
+            if 0 <= row < len(annots):
+                a = annots[row]
+                try:
+                    self.session.annot_delete(a["page"], a["type"].lower().replace(" ", ""), a["rect"], a["content"])
+                except Exception:
+                    # 类型名映射失败时退化按矩形删除
+                    self.session.annot_delete(a["page"], a["type"], a["rect"], a["content"])
+                self.after_document_change()
+                dlg.accept()
+
+        btn_del.clicked.connect(del_selected)
+        btn_close.clicked.connect(dlg.reject)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(lst)
+        h = QHBoxLayout()
+        h.addWidget(btn_del)
+        h.addWidget(btn_close)
+        lay.addLayout(h)
+        dlg.exec()
 
     # ---------- 文档 ----------
     def load_doc(self, path):
