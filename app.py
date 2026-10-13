@@ -635,8 +635,11 @@ class MainWindow(QMainWindow):
         sb.setValue(max(0, pos.y() - 8) if top else pos.y())
 
     def _sync_current_page(self, _=None):
-        """滚动位置 -> 当前页码（连续模式核心）"""
+        """滚动位置 -> 当前页码（连续模式核心）；显式导航后短暂抑制"""
+        import time as _time
         if not self._canvases or self.view_mode != "continuous":
+            return
+        if _time.monotonic() < getattr(self, "_nav_until", 0):
             return
         vp_center = self.scroll.viewport().height() // 2
         sb = self.scroll.verticalScrollBar()
@@ -698,12 +701,12 @@ class MainWindow(QMainWindow):
                                        None, "Ctrl+L", checkable=True, text_mode=True)
         self.a_view.toggled.connect(self.toggle_view_mode)
         row1.addSpacing(12)
-        self.a_prev = self._mk_row_btn(row1, "prev", "◀", "上一页 (PgUp)", lambda: self.page_by(-1), "PgUp", icon="prev")
+        self.a_prev = self._mk_row_btn(row1, "prev", "◀", "上一页 (PgUp)", lambda: self.jump_page(-1), "PgUp", icon="prev")
         self.spin_page = QSpinBox()
         self.spin_page.setMinimum(1)
         self.spin_page.valueChanged.connect(self.goto_page)
         row1.addWidget(self.spin_page)
-        self.a_next = self._mk_row_btn(row1, "next", "▶", "下一页 (PgDn)", lambda: self.page_by(+1), "PgDn", icon="next")
+        self.a_next = self._mk_row_btn(row1, "next", "▶", "下一页 (PgDn)", lambda: self.jump_page(+1), "PgDn", icon="next")
         h.addLayout(row1)
         h.addStretch(1)
         lbl_app = QLabel("pdfedit")
@@ -850,7 +853,8 @@ class MainWindow(QMainWindow):
         if not path:
             return
         data = self.session.list_annots()
-        json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
         self.statusBar().showMessage(f"已导出 {len(data)} 条批注 -> {path}", 8000)
 
     def act_import_annots(self):
@@ -860,7 +864,12 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "导入批注", "", "JSON (*.json)")
         if not path:
             return
-        data = json.load(open(path, encoding="utf-8"))
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.toast(f"导入失败：{e}")
+            return
         n = 0
         for a in data:
             sub = {"Text": "note", "FreeText": "freetext", "Ink": "ink",
@@ -869,7 +878,8 @@ class MainWindow(QMainWindow):
                    "Underline": "underline", "StrikeOut": "strikeout"}.get(a["type"])
             if not sub:
                 continue
-            params = {k: v for k, v in a.items() if k not in ("type",)}
+            params = {k: v for k, v in a.items()
+                      if k not in ("type", "page", "xref")}
             if sub in ("highlight", "underline", "strikeout"):
                 r = a["rect"]
                 params["quads"] = [[r[0], r[1], r[2], r[1], r[2], r[3], r[0], r[3]]]
@@ -948,6 +958,9 @@ class MainWindow(QMainWindow):
         self.a_undo.setEnabled(s.can_undo)
         self.a_redo.setEnabled(s.can_redo)
         self.a_save.setEnabled(s.ptr > 0)
+        multi = s.view().page_count > 1
+        self.a_prev.setEnabled(multi)
+        self.a_next.setEnabled(multi)
         self.spin_page.setRange(1, s.view().page_count)
         self._update_status()
         self.refresh_all_pages()
@@ -978,16 +991,36 @@ class MainWindow(QMainWindow):
 
     def do_save(self):
         if not self.session or self.session.ptr == 0:
+            self.toast("没有未保存的修改")
             return
         try:
             r = self.session.save_incremental()
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
             return
-        self.statusBar().showMessage(
-            f"已保存: {r['bytes']:,} 字节 | %%EOF={r['eof']} | "
-            f"原字节不动={r['base_prefix_intact']}", 10000)
         self.after_document_change()
+        self.toast(f"✓ 已保存 {r['bytes']:,} 字节 · 增量层=1 · 原字节不动")
+
+    # ---------- 浮动提示 ----------
+    def toast(self, text: str, msec: int = 2600):
+        """WPS 风格浮动气泡反馈（画布顶部居中，自动消失）"""
+        from PySide6.QtWidgets import QLabel
+        if getattr(self, "_toast", None):
+            self._toast.deleteLater()
+        t = QLabel(text, self.scroll.viewport())
+        t.setObjectName("toast")
+        t.setStyleSheet("""
+            background: rgba(43, 109, 232, 0.92); color: white;
+            border-radius: 14px; padding: 7px 18px; font-size: 13px;
+        """)
+        t.adjustSize()
+        vw = self.scroll.viewport().width()
+        t.move(max(8, (vw - t.width()) // 2), 14)
+        t.show()
+        t.raise_()
+        self._toast = t
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(msec, t.deleteLater)
 
     # ---------- 视图 ----------
     def zoom_by(self, dz):
@@ -997,18 +1030,24 @@ class MainWindow(QMainWindow):
         self._scroll_to_page(self.page_num, top=False)
 
     def page_by(self, d):
+        """PgUp/PgDn：连续模式按视口滚动；单页模式翻页"""
         if self.view_mode == "continuous" and self._canvases:
-            # 连续模式：PgUp/PgDn 按视口高度滚动
             sb = self.scroll.verticalScrollBar()
             step = int(self.scroll.viewport().height() * 0.9)
             sb.setValue(sb.value() + d * step)
             return
         self.goto_page_value(self.page_num + d)
 
+    def jump_page(self, d):
+        """◀/▶ 按钮：两种模式下都直接跳页"""
+        self.goto_page_value(self.page_num + d)
+
     def goto_page_value(self, n):
         if self.session is None:
             return
         n = max(0, min(self.session.view().page_count - 1, n))
+        import time as _time
+        self._nav_until = _time.monotonic() + 0.5   # 抑制滚动同步"抢答"
         self.page_num = n
         self.spin_page.blockSignals(True)
         self.spin_page.setValue(n + 1)
@@ -1016,7 +1055,8 @@ class MainWindow(QMainWindow):
         if self.view_mode == "single":
             self._apply_view_mode()
         else:
-            self._scroll_to_page(n, top=True)
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self._scroll_to_page(n, top=True))
         self.canvas.refresh()
         self._update_status()
 
