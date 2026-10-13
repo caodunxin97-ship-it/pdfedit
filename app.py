@@ -32,14 +32,16 @@ def _rect_of(p1, p2):
 
 
 class PageCanvas(QWidget):
-    """当前页渲染 + 文字 span 命中/高亮 + 原位编辑框"""
+    """单页渲染 + 文字 span 命中/高亮 + 原位编辑框（每页一个实例，懒渲染）"""
 
-    def __init__(self, main):
+    def __init__(self, main, page_no=0):
         super().__init__()
         self.main = main
+        self.page_no = page_no
         self.pixmap = None
         self.spans = []
         self._hover = -1
+        self._dirty = True          # 懒渲染标记：可见时再渲染
         self.editor = QLineEdit(self)
         self.editor.hide()
         self.editor.returnPressed.connect(self.commit_edit)
@@ -64,19 +66,33 @@ class PageCanvas(QWidget):
         self.setFocusPolicy(Qt.ClickFocus)
 
     # ---------- 渲染 ----------
+    def _visible_now(self) -> bool:
+        return not self.visibleRegion().isEmpty()
+
     def refresh(self):
+        """渲染本页；不可见时仅标记脏，等滚动到再渲（懒渲染）"""
+        s = self.main.session
+        if s is None or self.page_no >= s.view().page_count:
+            return
+        if not self._visible_now() and self.page_no != self.main.page_num:
+            self._dirty = True
+            self.update()
+            return
+        self._render_now()
+
+    def _render_now(self):
         s = self.main.session
         if s is None:
             return
-        png = s.render_png(self.main.page_num, self.main.zoom,
+        png = s.render_png(self.page_no, self.main.zoom,
                            annots=self.main.show_annots)
         pm = QPixmap()
         pm.loadFromData(png)
         self.pixmap = pm
-        self.spans = s.spans(self.main.page_num)
+        self.spans = s.spans(self.page_no)
         try:
             self._annots = [a for a in s.list_annots()
-                            if a["page"] == self.main.page_num]
+                            if a["page"] == self.page_no]
         except Exception:
             self._annots = []
         self._hover = -1
@@ -85,13 +101,25 @@ class PageCanvas(QWidget):
         self._sel_annot = None
         self._rubber = None
         self._ink_pts = None
+        self._dirty = False
         self.resize(pm.size())
         self.setMinimumSize(pm.size())
         self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
-        if self.pixmap:
+        if self.pixmap is None or self._dirty:
+            # 占位页（懒渲染等待中）
+            from PySide6.QtCore import QTimer
+            r = self.rect()
+            p.fillRect(r, QColor("#FFFFFF"))
+            p.setPen(QPen(QColor("#C6CBD4"), 1))
+            p.drawRect(r.adjusted(0, 0, -1, -1))
+            p.setPen(QPen(QColor("#9AA1AC"), 1))
+            p.drawText(r, Qt.AlignCenter, f"第 {self.page_no + 1} 页")
+            if self._visible_now():
+                QTimer.singleShot(0, self._render_now)
+        else:
             p.drawPixmap(0, 0, self.pixmap)
         if self._dragging and self._press_span >= 0:
             # 拖拽中：原位置虚线框 + 跟随鼠标的幽灵文字预览 + 对齐参考线
@@ -288,7 +316,7 @@ class PageCanvas(QWidget):
                 b = self.spans[i]["bbox"]
                 quad = [b[0], b[1], b[2], b[1], b[2], b[3], b[0], b[3]]
                 try:
-                    self.main.session.annot_add(self.main.page_num, tool, quads=[quad])
+                    self.main.session.annot_add(self.page_no, tool, quads=[quad])
                     self.main.after_document_change()
                 except Exception as e:
                     QMessageBox.warning(self, "批注失败", str(e))
@@ -297,7 +325,7 @@ class PageCanvas(QWidget):
             from PySide6.QtWidgets import QInputDialog
             text, ok = QInputDialog.getMultiLineText(self, "便签批注", "批注内容：")
             if ok and text:
-                self.main.session.annot_add(self.main.page_num, "note",
+                self.main.session.annot_add(self.page_no, "note",
                                             point=pos_pg, content=text)
                 self.main.after_document_change()
             return
@@ -309,7 +337,7 @@ class PageCanvas(QWidget):
             if ok:
                 w = h = 80
                 rect = [pos_pg[0], pos_pg[1], pos_pg[0] + w, pos_pg[1] + h]
-                self.main.session.annot_add(self.main.page_num, "stamp",
+                self.main.session.annot_add(self.page_no, "stamp",
                                             rect=rect, stamp=name)
                 self.main.after_document_change()
             return
@@ -335,7 +363,7 @@ class PageCanvas(QWidget):
                 except Exception:
                     pass
                 rect = [pos_pg[0], pos_pg[1], pos_pg[0] + w_pt, pos_pg[1] + h_pt]
-                self.main.session.insert_image(self.main.page_num, rect, img_bytes)
+                self.main.session.insert_image(self.page_no, rect, img_bytes)
                 self.main.after_document_change()
             except Exception as e:
                 QMessageBox.warning(self, "插入图片失败", str(e))
@@ -387,21 +415,21 @@ class PageCanvas(QWidget):
                 if tool == "area_hl":
                     quad = [rect[0], rect[1], rect[2], rect[1],
                             rect[2], rect[3], rect[0], rect[3]]
-                    self.main.session.annot_add(self.main.page_num, "highlight", quads=[quad])
+                    self.main.session.annot_add(self.page_no, "highlight", quads=[quad])
                 elif tool == "textbox":
                     from PySide6.QtWidgets import QInputDialog
                     text, ok = QInputDialog.getMultiLineText(self, "文本框批注", "内容：")
                     if ok and text:
-                        self.main.session.annot_add(self.main.page_num, "freetext",
+                        self.main.session.annot_add(self.page_no, "freetext",
                                                     rect=rect, content=text, size=12)
                     else:
                         return
                 elif tool == "rect":
-                    self.main.session.annot_add(self.main.page_num, "rect", rect=rect)
+                    self.main.session.annot_add(self.page_no, "rect", rect=rect)
                 elif tool == "oval":
-                    self.main.session.annot_add(self.main.page_num, "oval", rect=rect)
+                    self.main.session.annot_add(self.page_no, "oval", rect=rect)
                 elif tool in ("line", "arrow"):
-                    self.main.session.annot_add(self.main.page_num, tool,
+                    self.main.session.annot_add(self.page_no, tool,
                                                 p1=[self._rubber_start[0], self._rubber_start[1]],
                                                 p2=[pos_pg[0], pos_pg[1]])
                 self.main.after_document_change()
@@ -413,7 +441,7 @@ class PageCanvas(QWidget):
             self.update()
             if len(pts) >= 2:
                 try:
-                    self.main.session.annot_add(self.main.page_num, "ink", strokes=[pts])
+                    self.main.session.annot_add(self.page_no, "ink", strokes=[pts])
                     self.main.after_document_change()
                 except Exception as e:
                     QMessageBox.warning(self, "批注失败", str(e))
@@ -431,7 +459,7 @@ class PageCanvas(QWidget):
             dx = eff.x() / self.main.zoom
             dy = eff.y() / self.main.zoom
             try:
-                self.main.session.move_span(self.main.page_num, i, dx, dy)
+                self.main.session.move_span(self.page_no, i, dx, dy)
             except Exception as e:
                 QMessageBox.warning(self, "移动失败", str(e))
             self.main.after_document_change()
@@ -488,7 +516,7 @@ class PageCanvas(QWidget):
             self.editor.hide()
             if text:
                 try:
-                    self.main.session.insert_text(self.main.page_num, pt, text, size=12)
+                    self.main.session.insert_text(self.page_no, pt, text, size=12)
                 except Exception as e:
                     QMessageBox.warning(self, "插入失败", str(e))
                 self.main.after_document_change()
@@ -503,7 +531,7 @@ class PageCanvas(QWidget):
         if not new_text or new_text == old:
             return
         try:
-            self.main.session.edit_span(self.main.page_num, idx, new_text)
+            self.main.session.edit_span(self.page_no, idx, new_text)
         except Exception as e:
             QMessageBox.warning(self, "编辑失败", str(e))
         self.main.after_document_change()
@@ -519,27 +547,128 @@ class MainWindow(QMainWindow):
         self.page_num = 0
         self.tool = "select"
         self.show_annots = True
+        self.view_mode = "continuous"      # continuous | single
 
-        self.canvas = PageCanvas(self)
+        # 多页容器：每页一个 PageCanvas，纵向排列（懒渲染）
+        from PySide6.QtWidgets import QWidget, QVBoxLayout, QGraphicsDropShadowEffect
+        self._pages_widget = QWidget()
+        self._pages_layout = QVBoxLayout(self._pages_widget)
+        self._pages_layout.setAlignment(Qt.AlignHCenter)
+        self._pages_layout.setSpacing(26)
+        self._pages_layout.addStretch(1)
+        self._canvases: list[PageCanvas] = []
+
         self.scroll = QScrollArea()
-        self.scroll.setWidget(self.canvas)
-        self.scroll.setAlignment(Qt.AlignCenter)
+        self.scroll.setWidget(self._pages_widget)
+        self.scroll.setWidgetResizable(True)
         self.scroll.setViewportMargins(28, 24, 28, 24)
         self.scroll.setFrameShape(QScrollArea.NoFrame)
         self.setCentralWidget(self.scroll)
         # 页面阴影（贴近 WPS 阅读视图的页面浮层效果）
-        from PySide6.QtWidgets import QGraphicsDropShadowEffect
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(30)
         shadow.setOffset(0, 4)
         shadow.setColor(QColor(30, 40, 60, 70))
-        self.canvas.setGraphicsEffect(shadow)
+        self._pages_widget.setGraphicsEffect(shadow)
+        # 滚动 -> 当前页同步；视口滚轮拦截（单页模式边界翻页）
+        self.scroll.verticalScrollBar().valueChanged.connect(self._sync_current_page)
+        self.scroll.viewport().installEventFilter(self)
 
         self._build_toolbar()
         self.statusBar().showMessage("就绪 — Ctrl+O 打开 PDF，点击文字开始编辑")
 
         if doc_path and os.path.exists(doc_path):
             self.load_doc(doc_path)
+
+    # ---------- 页面管理 ----------
+    @property
+    def canvas(self) -> PageCanvas:
+        """当前页画布（兼容旧接口）"""
+        return self._canvases[self.page_num] if self._canvases else None
+
+    def _rebuild_pages(self):
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect
+        # 清旧
+        while self._pages_layout.count() > 1:
+            item = self._pages_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._canvases = []
+        if not self.session:
+            return
+        n = self.session.view().page_count
+        for i in range(n):
+            c = PageCanvas(self, i)
+            shadow = QGraphicsDropShadowEffect(self)
+            shadow.setBlurRadius(30)
+            shadow.setOffset(0, 4)
+            shadow.setColor(QColor(30, 40, 60, 70))
+            c.setGraphicsEffect(shadow)
+            self._pages_layout.insertWidget(self._pages_layout.count() - 1, c)
+            self._canvases.append(c)
+        self._apply_view_mode()
+
+    def _apply_view_mode(self):
+        """single：仅显示当前页；continuous：全部显示"""
+        for i, c in enumerate(self._canvases):
+            c.setVisible(self.view_mode == "continuous" or i == self.page_num)
+        if self.view_mode == "single":
+            self._scroll_to_page(self.page_num, top=True)
+
+    def set_view_mode(self, mode):
+        self.view_mode = mode
+        self._apply_view_mode()
+
+    def toggle_view_mode(self, checked=False):
+        self.set_view_mode("single" if checked else "continuous")
+        if hasattr(self, "a_view"):
+            self.a_view.setText("连续" if self.view_mode == "single" else "单页")
+        self._update_status()
+
+    def _scroll_to_page(self, n, top=True):
+        if not (0 <= n < len(self._canvases)):
+            return
+        c = self._canvases[n]
+        pos = c.mapTo(self._pages_widget, c.rect().topLeft())
+        sb = self.scroll.verticalScrollBar()
+        sb.setValue(max(0, pos.y() - 8) if top else pos.y())
+
+    def _sync_current_page(self, _=None):
+        """滚动位置 -> 当前页码（连续模式核心）"""
+        if not self._canvases or self.view_mode != "continuous":
+            return
+        vp_center = self.scroll.viewport().height() // 2
+        sb = self.scroll.verticalScrollBar()
+        ref_y = sb.value() + vp_center
+        for i, c in enumerate(self._canvases):
+            if c.isHidden():
+                continue
+            pos = c.mapTo(self._pages_widget, c.rect().topLeft())
+            if pos.y() <= ref_y <= pos.y() + c.height():
+                if i != self.page_num:
+                    self.page_num = i
+                    self.spin_page.blockSignals(True)
+                    self.spin_page.setValue(i + 1)
+                    self.spin_page.blockSignals(False)
+                    self._update_status()
+                return
+
+    def eventFilter(self, obj, ev):
+        # 单页模式：滚轮在页面底/顶继续滚 -> 翻页（WPS 行为）
+        if obj is self.scroll.viewport() and ev.type() == ev.Type.Wheel \
+                and self.view_mode == "single" and self._canvases:
+            sb = self.scroll.verticalScrollBar()
+            dy = ev.angleDelta().y()
+            at_min = sb.value() <= sb.minimum() + 1
+            at_max = sb.value() >= sb.maximum() - 1
+            if dy < 0 and at_max and self.page_num < len(self._canvases) - 1:
+                self.page_by(+1)
+                return True
+            if dy > 0 and at_min and self.page_num > 0:
+                self.page_by(-1)
+                return True
+        return super().eventFilter(obj, ev)
 
     # ---------- 工具栏（WPS 风格双行头部） ----------
     def _build_toolbar(self):
@@ -564,6 +693,10 @@ class MainWindow(QMainWindow):
         self.lbl_zoom.setStyleSheet("color:#9AA1AC; font-size:12px;")
         row1.addWidget(self.lbl_zoom)
         self._mk_row_btn(row1, "zoom_in", "＋", "放大", lambda: self.zoom_by(+0.25), "=", icon="zoom_in")
+        row1.addSpacing(12)
+        self.a_view = self._mk_row_btn(row1, "view", "单页", "连续/单页视图切换（滚轮翻页在两种模式都可用）",
+                                       None, "Ctrl+L", checkable=True, text_mode=True)
+        self.a_view.toggled.connect(self.toggle_view_mode)
         row1.addSpacing(12)
         self.a_prev = self._mk_row_btn(row1, "prev", "◀", "上一页 (PgUp)", lambda: self.page_by(-1), "PgUp", icon="prev")
         self.spin_page = QSpinBox()
@@ -796,6 +929,7 @@ class MainWindow(QMainWindow):
             return
         self.page_num = 0
         self.spin_page.setEnabled(True)
+        self._rebuild_pages()
         self.spin_page.setRange(1, self.session.view().page_count)
         self.spin_page.setValue(1)
         self.canvas.refresh()
@@ -815,11 +949,22 @@ class MainWindow(QMainWindow):
         self.a_redo.setEnabled(s.can_redo)
         self.a_save.setEnabled(s.ptr > 0)
         self.spin_page.setRange(1, s.view().page_count)
-        self.lbl_zoom.setText(f" {int(self.zoom * 100)}% ")
+        self._update_status()
+        self.refresh_all_pages()
+
+    def _update_status(self):
+        s = self.session
+        if s is None:
+            return
+        mode = "连续" if self.view_mode == "continuous" else "单页"
         self.statusBar().showMessage(
-            f"{s.path}  |  第 {self.page_num + 1}/{s.view().page_count} 页  |  "
+            f"{s.path}  |  第 {self.page_num + 1}/{s.view().page_count} 页 [{mode}]  |  "
             f"{s.ptr} 个未保存操作")
-        self.canvas.refresh()
+
+    def refresh_all_pages(self):
+        """当前页立即渲染，其余标脏（滚动到时懒渲染）"""
+        for i, c in enumerate(self._canvases):
+            c.refresh()
 
     def do_undo(self):
         if self.session and self.session.undo():
@@ -847,10 +992,17 @@ class MainWindow(QMainWindow):
     # ---------- 视图 ----------
     def zoom_by(self, dz):
         self.zoom = max(0.5, min(4.0, self.zoom + dz))
-        self.canvas.refresh()
+        self.refresh_all_pages()
         self.lbl_zoom.setText(f" {int(self.zoom * 100)}% ")
+        self._scroll_to_page(self.page_num, top=False)
 
     def page_by(self, d):
+        if self.view_mode == "continuous" and self._canvases:
+            # 连续模式：PgUp/PgDn 按视口高度滚动
+            sb = self.scroll.verticalScrollBar()
+            step = int(self.scroll.viewport().height() * 0.9)
+            sb.setValue(sb.value() + d * step)
+            return
         self.goto_page_value(self.page_num + d)
 
     def goto_page_value(self, n):
@@ -858,16 +1010,20 @@ class MainWindow(QMainWindow):
             return
         n = max(0, min(self.session.view().page_count - 1, n))
         self.page_num = n
-        self.spin_page.setValue(n + 1)  # 触发 goto_page
+        self.spin_page.blockSignals(True)
+        self.spin_page.setValue(n + 1)
+        self.spin_page.blockSignals(False)
+        if self.view_mode == "single":
+            self._apply_view_mode()
+        else:
+            self._scroll_to_page(n, top=True)
         self.canvas.refresh()
-        self.after_document_change()
+        self._update_status()
 
     def goto_page(self, v):
         if self.session is None:
             return
-        self.page_num = v - 1
-        self.canvas.refresh()
-        self.after_document_change()
+        self.goto_page_value(v - 1)
 
     def _clamp_page(self):
         if self.session:
